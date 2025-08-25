@@ -1,163 +1,203 @@
-"""Data loading module for Iris dataset."""
-
 import pandas as pd
-import os
 import logging
-from typing import Optional, Tuple
-import requests
 from pathlib import Path
+import requests
 import time
-from dataclasses import dataclass
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DataConfig:
-    """Configuration for data loading."""
-    url: str = "https://huggingface.co/datasets/scikit-learn/iris/resolve/main/Iris.csv"
-    data_dir: str = "data"
-    filename: str = "Iris.csv"
-    timeout: int = 30
-    max_retries: int = 3
-    retry_delay: float = 2.0
-
-
 class DataLoader:
-    """Class for loading and managing dataset."""
 
-    def __init__(self, config: Optional[DataConfig] = None):
-        self.config = config or DataConfig()
+    def __init__(self, url: str, data_dir: str = "data", filename: str = "dataset.csv"):
+        self.url = url
+        self.data_dir = Path(data_dir)
+        self.filename = filename
+        self.file_path = self.data_dir / self.filename
+        self.scaler = StandardScaler()
+        self.label_encoders = {}
+
         self._ensure_data_directory()
+        logger.info(f"DataLoader initialized for {self.file_path}")
 
     def _ensure_data_directory(self) -> None:
         """Create data directory if it doesn't exist."""
         try:
-            Path(self.config.data_dir).mkdir(parents=True, exist_ok=True)
-            logger.info(f"Data directory ensured: {self.config.data_dir}")
-        except PermissionError:
-            logger.error(f"Permission denied to create directory: {self.config.data_dir}")
-            raise
-        except OSError as e:
-            logger.error(f"Failed to create data directory: {e}")
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Data directory ensured: {self.data_dir}")
+        except Exception as e:
+            logger.error(f"Directory creation error: {e}")
             raise
 
     def _download_file(self) -> bool:
-        """Download the dataset file with retry mechanism."""
-        file_path = Path(self.config.data_dir) / self.config.filename
-
-        for attempt in range(self.config.max_retries):
+        """Download file with retry mechanism."""
+        for attempt in range(3):
             try:
-                logger.info(f"Download attempt {attempt + 1} for {self.config.url}")
+                logger.info(f"Download attempt {attempt + 1}: {self.url}")
 
-                response = requests.get(
-                    self.config.url,
-                    timeout=self.config.timeout,
-                    stream=True
-                )
+                response = requests.get(self.url, timeout=30, stream=True)
                 response.raise_for_status()
 
-                # Save file in chunks to handle large files
-                with open(file_path, 'wb') as f:
+                with open(self.file_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
 
-                logger.info(f"Successfully downloaded file to {file_path}")
+                logger.info(f"File successfully downloaded: {self.file_path}")
                 return True
 
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"Download attempt {attempt + 1} failed: {e}")
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(self.config.retry_delay)
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2)
                 else:
-                    logger.error(f"All download attempts failed for {self.config.url}")
+                    logger.error("All download attempts failed")
                     return False
-            except IOError as e:
-                logger.error(f"File write error: {e}")
-                return False
-
         return False
 
-    def load_data(self) -> Tuple[pd.DataFrame, bool]:
-        """
-        Load Iris dataset from local file or download if not exists.
+    def load_data(self) -> pd.DataFrame:
 
-        Returns:
-            Tuple containing DataFrame and boolean indicating if data was downloaded
-        """
-        file_path = Path(self.config.data_dir) / self.config.filename
-        downloaded = False
-
-        # Check if file exists locally
-        if not file_path.exists():
-            logger.info("Local file not found, attempting download...")
-            success = self._download_file()
-            if not success:
-                raise FileNotFoundError(f"Failed to download dataset from {self.config.url}")
-            downloaded = True
+        if not self.file_path.exists():
+            logger.info("Local file not found, downloading...")
+            if not self._download_file():
+                raise FileNotFoundError(f"Failed to download from {self.url}")
 
         try:
-            # Load data with proper error handling
-            df = pd.read_csv(file_path)
-            logger.info(f"Successfully loaded dataset with shape {df.shape}")
+            df = pd.read_csv(self.file_path)
+            logger.info(f"Data loaded successfully, shape: {df.shape}")
+            return df
 
-            # Basic data validation
-            if df.empty:
-                logger.warning("Loaded dataset is empty")
-
-            return df, downloaded
-
-        except pd.errors.EmptyDataError:
-            logger.error("The dataset file is empty")
-            raise
-        except pd.errors.ParserError:
-            logger.error("Error parsing CSV file")
-            raise
         except Exception as e:
-            logger.error(f"Unexpected error loading data: {e}")
+            logger.error(f"Data loading error: {e}")
             raise
 
-    def get_dataset_info(self, df: pd.DataFrame) -> dict:
-        """Get basic information about the dataset."""
-        return {
-            "shape": df.shape,
-            "columns": list(df.columns),
-            "dtypes": df.dtypes.to_dict(),
-            "null_counts": df.isnull().sum().to_dict(),
-            "memory_usage_mb": df.memory_usage(deep=True).sum() / 1024 ** 2
-        }
+    def preprocess_data(self, df: pd.DataFrame, target_column: str = None) -> pd.DataFrame:
+
+        logger.info("Starting data preprocessing...")
+
+        # Create a copy to avoid modifying original data
+        processed_df = df.copy()
+
+        # 1. Cleaning: Handle missing values
+        numeric_cols = processed_df.select_dtypes(include=[np.number]).columns
+        categorical_cols = processed_df.select_dtypes(include=['object']).columns
+
+        # Fill numeric missing values with median
+        for col in numeric_cols:
+            if processed_df[col].isnull().any():
+                processed_df[col].fillna(processed_df[col].median(), inplace=True)
+                logger.info(f"Filled missing values in {col} with median")
+
+        # Fill categorical missing values with mode
+        for col in categorical_cols:
+            if processed_df[col].isnull().any():
+                processed_df[col].fillna(processed_df[col].mode()[0], inplace=True)
+                logger.info(f"Filled missing values in {col} with mode")
+
+        # 2. Label encoding for categorical columns (excluding target if specified)
+        columns_to_encode = categorical_cols
+        if target_column and target_column in categorical_cols:
+            columns_to_encode = [col for col in categorical_cols if col != target_column]
+
+        for col in columns_to_encode:
+            le = LabelEncoder()
+            processed_df[col] = le.fit_transform(processed_df[col].astype(str))
+            self.label_encoders[col] = le
+            logger.info(f"Label encoded column: {col}")
+
+        # 3. Normalization of numeric columns (excluding target if specified)
+        cols_to_normalize = numeric_cols
+        if target_column and target_column in numeric_cols:
+            cols_to_normalize = [col for col in numeric_cols if col != target_column]
+
+        if len(cols_to_normalize) > 0:
+            processed_df[cols_to_normalize] = self.scaler.fit_transform(processed_df[cols_to_normalize])
+            logger.info(f"Normalized columns: {cols_to_normalize}")
+
+        logger.info("Data preprocessing completed")
+        return processed_df
+
+    def train_test_split_data(self, df: pd.DataFrame, target_column: str,
+                              test_size: float = 0.2, random_state: int = 42):
+        """
+        Split data into train and test sets.
+
+        Args:
+            df: Input DataFrame
+            target_column: Name of target column
+            test_size: Proportion of test data
+            random_state: Random seed for reproducibility
+
+        Returns:
+            Tuple of (X_train, X_test, y_train, y_test)
+        """
+        logger.info(f"Splitting data with test_size={test_size}")
+
+        if target_column not in df.columns:
+            raise ValueError(f"Target column '{target_column}' not found in DataFrame")
+
+        X = df.drop(columns=[target_column])
+        y = df[target_column]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+
+        return X_train, X_test, y_train, y_test
+
+    def save_csv_data(self, X_train: pd.DataFrame, X_test: pd.DataFrame,
+                             y_train: pd.Series, y_test: pd.Series):
+        """
+        Save structured data to CSV files in data directory.
+        """
+        logger.info("Saving data...")
+
+        # Save all files in the data directory
+        X_train.to_csv(self.data_dir / "X_train.csv", index=False)
+        X_test.to_csv(self.data_dir / "X_test.csv", index=False)
+        y_train.to_csv(self.data_dir / "y_train.csv", index=False)
+        y_test.to_csv(self.data_dir / "y_test.csv", index=False)
+
+        logger.info(f"Structured data saved to {self.data_dir}")
+        logger.info(f"Files created: X_train.csv, X_test.csv, y_train.csv, y_test.csv")
+
+    def get_file_path(self) -> Path:
+        """Return the path to the data file."""
+        return self.file_path
 
 
-def main() -> None:
-    """Main function to demonstrate data loading."""
-    try:
-        # Initialize data loader
-        config = DataConfig()
-        loader = DataLoader(config)
-
-        # Load data
-        df, downloaded = loader.load_data()
-
-        # Log dataset information
-        info = loader.get_dataset_info(df)
-        logger.info(f"Dataset loaded successfully. Info: {info}")
-
-        # Additional processing can be added here
-        logger.info(f"First few rows:\n{df.head()}")
-
-    except Exception as e:
-        logger.error(f"Failed to load dataset: {e}")
-        raise
-
-
+# Example usage
 if __name__ == "__main__":
-    main()
+    loader = DataLoader(
+        url="https://huggingface.co/datasets/scikit-learn/iris/resolve/main/Iris.csv",
+        data_dir="data",
+        filename="Iris.csv"
+    )
+
+    # Load raw data
+    df = loader.load_data()
+
+    # Preprocess data
+    processed_df = loader.preprocess_data(df, target_column="Species")
+
+    # Split into train and test
+    X_train, X_test, y_train, y_test = loader.train_test_split_data(
+        processed_df, target_column="Species", test_size=0.2
+    )
+
+    # Save structured data
+    loader.save_csv_data(X_train, X_test, y_train, y_test)
+
+    # Display results
+    logger.info(f"Original data shape: {df.shape}")
+    logger.info(f"Processed data shape: {processed_df.shape}")
+    logger.info(f"X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
+
